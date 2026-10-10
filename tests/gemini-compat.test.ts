@@ -280,3 +280,150 @@ it('does not touch other requests or non-JSON bodies', async () => {
   expect(inner.mock.calls[1][1]?.body).toBe('not json');
   expect(inner.mock.calls[2][1]?.body).toBeUndefined();
 });
+
+it('tells unindexed streamed tool calls apart by their IDs', async () => {
+  await receive(
+    'unindexed',
+    sse([
+      {
+        tool_calls: [
+          {
+            id: 'call-x',
+            function: { name: 'lookup', arguments: '{"n":1}' },
+            extra_content: { google: { thought_signature: 'SIG-X' } },
+          },
+        ],
+      },
+      {
+        tool_calls: [
+          {
+            id: 'call-y',
+            function: { name: 'lookup', arguments: '{"n":2}' },
+            extra_content: { google: { thought_signature: 'SIG-Y' } },
+          },
+        ],
+      },
+    ]),
+  );
+  await eventually('unindexed', history('call-x', '{"n":1}'), 'SIG-X');
+  await eventually('unindexed', history('call-y', '{"n":2}'), 'SIG-Y');
+});
+
+it('keeps tool calls from different choices apart', async () => {
+  const chunk = (choice: number, call: Record<string, unknown>) => ({
+    choices: [
+      { index: choice, delta: { tool_calls: [{ index: 0, ...call }] } },
+    ],
+  });
+  const signed = (signature: string) => ({
+    extra_content: { google: { thought_signature: signature } },
+  });
+  const events = [
+    chunk(0, { id: 'call-choice-0', function: { name: 'lookup' } }),
+    chunk(1, { id: 'call-choice-1', function: { name: 'lookup' } }),
+    chunk(0, signed('SIG-C0')),
+    chunk(1, signed('SIG-C1')),
+  ];
+  await receive(
+    'choices',
+    new Response(
+      events.map((c) => `data: ${JSON.stringify(c)}\n\n`).join('') +
+        'data: [DONE]\n\n',
+      { headers: { 'Content-Type': 'text/event-stream' } },
+    ),
+  );
+  await eventually('choices', history('call-choice-0'), 'SIG-C0');
+  await eventually('choices', history('call-choice-1'), 'SIG-C1');
+});
+
+it('keeps learning after a malformed event in the stream', async () => {
+  const good = `data: ${JSON.stringify({
+    choices: [
+      {
+        index: 0,
+        delta: { tool_calls: [toolCall('call-after', 'SIG-AFTER')] },
+      },
+    ],
+  })}\n\n`;
+  await receive(
+    'malformed',
+    new Response(`data: {not json\n\n${good}data: [DONE]\n\n`, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    }),
+  );
+  await eventually('malformed', history('call-after'), 'SIG-AFTER');
+});
+
+it('does not remember anything from a failed response', async () => {
+  const failed = new Response(
+    JSON.stringify({
+      choices: [
+        { message: { tool_calls: [toolCall('call-failed', 'SIG-BAD')] } },
+      ],
+    }),
+    { status: 500, headers: { 'Content-Type': 'application/json' } },
+  );
+  await receive('failed', failed);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(await replay('failed', history('call-failed'))).toBe(PLACEHOLDER);
+});
+
+it('forgets the oldest argument variants when one ID is reused many times', async () => {
+  for (let n = 1; n <= 5; n += 1)
+    await receive(
+      'many-reuses',
+      sse([{ tool_calls: [toolCall('call_0', `SIG-${n}`, `{"n":${n}}`)] }]),
+    );
+  await eventually('many-reuses', history('call_0', '{"n":5}'), 'SIG-5');
+  await eventually('many-reuses', history('call_0', '{"n":2}'), 'SIG-2');
+  // Only the four most recent are kept; the evicted one falls back safely.
+  expect(await replay('many-reuses', history('call_0', '{"n":1}'))).toBe(
+    PLACEHOLDER,
+  );
+});
+
+it('bounds memory by dropping the oldest tool calls', async () => {
+  const total = 5100;
+  for (let n = 0; n < total; n += 1)
+    await receive(
+      `bounded-${n}`,
+      sse([{ tool_calls: [toolCall('call_0', `SIG-${n}`)] }]),
+    );
+  await eventually(
+    `bounded-${total - 1}`,
+    history('call_0'),
+    `SIG-${total - 1}`,
+  );
+  expect(await replay('bounded-0', history('call_0'))).toBe(PLACEHOLDER);
+});
+
+it('uses the placeholder for a tool call without an ID', async () => {
+  const body = history('x');
+  delete (body.messages[1].tool_calls![0] as { id?: string }).id;
+  expect(await replay('no-id', body)).toBe(PLACEHOLDER);
+});
+
+it('keeps other extra_content fields when adding the signature', () => {
+  const body = history('call-extra');
+  Object.assign(body.messages[1].tool_calls![0], {
+    extra_content: { google: { other: 1 }, vendor: { keep: true } },
+  });
+  expect(restoreThoughtSignatures(body)).toBe(1);
+  const call = body.messages[1].tool_calls![0] as unknown as {
+    extra_content: Record<string, Record<string, unknown>>;
+  };
+  expect(call.extra_content.google).toEqual({
+    other: 1,
+    thought_signature: PLACEHOLDER,
+  });
+  expect(call.extra_content.vendor).toEqual({ keep: true });
+});
+
+it('restores signatures when fetch is called with a URL object and a query string', async () => {
+  const inner = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}'));
+  await geminiToolCallFetch('url-object', inner)(
+    new URL(`${ENDPOINT}?alt=json`),
+    { method: 'POST', body: JSON.stringify(history('call-url')) },
+  );
+  expect(signatureSent(inner.mock.calls[0][1])).toBe(PLACEHOLDER);
+});
